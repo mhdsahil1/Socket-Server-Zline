@@ -2,6 +2,7 @@
   "name": "zline-socket-server",
   "version": "1.0.0",
   "description": "Standalone signaling server for Zline WebRTC/Socket.IO calls",
+  "type": "module",
   "main": "src/server.ts",
   "scripts": {
     "dev": "tsx watch src/server.ts",
