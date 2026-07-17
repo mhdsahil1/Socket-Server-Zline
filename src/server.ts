@@ -213,6 +213,69 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ─── Message Edit ───────────────────────────────────────────────────
+  socket.on("message_edited", (data) => {
+    // data: { chatId?, targetUserId?, message }
+    if (data.chatId) {
+      socket.to(data.chatId).emit("message_edited", {
+        chatId: data.chatId,
+        message: data.message,
+      });
+    } else if (data.targetUserId) {
+      io.to(data.targetUserId).emit("message_edited", {
+        message: data.message,
+      });
+    }
+  });
+
+  // ─── Message Delete for Everyone ────────────────────────────────────
+  socket.on("message_deleted", (data) => {
+    // data: { chatId?, targetUserId?, messageId }
+    if (data.chatId) {
+      socket.to(data.chatId).emit("message_deleted", {
+        chatId: data.chatId,
+        messageId: data.messageId,
+      });
+    } else if (data.targetUserId) {
+      io.to(data.targetUserId).emit("message_deleted", {
+        messageId: data.messageId,
+      });
+    }
+  });
+
+  // ─── Pinned Messages ───────────────────────────────────────────────
+  socket.on("message_pinned", (data) => {
+    // data: { chatId?, targetUserId?, message, pinnedCount }
+    if (data.chatId) {
+      socket.to(data.chatId).emit("message_pinned", {
+        chatId: data.chatId,
+        message: data.message,
+        pinnedCount: data.pinnedCount,
+      });
+    } else if (data.targetUserId) {
+      io.to(data.targetUserId).emit("message_pinned", {
+        message: data.message,
+        pinnedCount: data.pinnedCount,
+      });
+    }
+  });
+
+  socket.on("message_unpinned", (data) => {
+    // data: { chatId?, targetUserId?, messageId, pinnedCount }
+    if (data.chatId) {
+      socket.to(data.chatId).emit("message_unpinned", {
+        chatId: data.chatId,
+        messageId: data.messageId,
+        pinnedCount: data.pinnedCount,
+      });
+    } else if (data.targetUserId) {
+      io.to(data.targetUserId).emit("message_unpinned", {
+        messageId: data.messageId,
+        pinnedCount: data.pinnedCount,
+      });
+    }
+  });
+
   // ─── WebRTC Signaling (Audio / Video Calls) ─────────────────────────
   // Caller → Callee: initiate a call
   socket.on("call_user", async (data) => {
