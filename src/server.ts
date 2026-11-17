@@ -4,6 +4,7 @@ import { Server } from "socket.io";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
 import dns from "dns";
+import crypto from "crypto";
 import { Chat } from "./models/Chat";
 import { Call } from "./models/Call";
 
@@ -16,10 +17,9 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 const app = express();
 const httpServer = createServer(app);
 
-const allowedOrigins = [
-  "http://localhost:3000",
-  "https://zline.vercel.app",
-];
+const allowedOrigins = process.env.CORS_ORIGINS 
+  ? process.env.CORS_ORIGINS.split(",")
+  : ["http://localhost:3000", "https://zline.vercel.app"];
 
 const io = new Server(httpServer, {
   cors: {
@@ -28,6 +28,49 @@ const io = new Server(httpServer, {
     credentials: true,
   },
   transports: ["websocket", "polling"], // support websocket and fallback polling
+});
+
+// ─── Authentication Middleware ──────────────────────────────────────
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) {
+    return next(new Error("Authentication error: No token provided"));
+  }
+  
+  try {
+    const [userId, timestampStr, signature] = token.split(".");
+    if (!userId || !timestampStr || !signature) {
+      return next(new Error("Authentication error: Invalid token format"));
+    }
+    
+    // Check expiry (5 minutes)
+    const timestamp = parseInt(timestampStr, 10);
+    if (Date.now() - timestamp > 5 * 60 * 1000) {
+      return next(new Error("Authentication error: Token expired"));
+    }
+    
+    const data = `${userId}:${timestampStr}`;
+    const secret = process.env.NEXTAUTH_SECRET;
+    if (!secret) {
+      return next(new Error("Authentication error: Server secret missing"));
+    }
+    
+    const expectedSignature = crypto.createHmac("sha256", secret).update(data).digest("hex");
+    
+    // Use timingSafeEqual to prevent timing attacks
+    const sigBuf = Buffer.from(signature);
+    const expectedSigBuf = Buffer.from(expectedSignature);
+    
+    if (sigBuf.length !== expectedSigBuf.length || !crypto.timingSafeEqual(sigBuf, expectedSigBuf)) {
+      return next(new Error("Authentication error: Invalid signature"));
+    }
+    
+    // Auth successful
+    (socket as any).userId = userId;
+    next();
+  } catch (error) {
+    next(new Error("Authentication error"));
+  }
 });
 
 // App default route
@@ -87,8 +130,8 @@ io.on("connection", (socket) => {
   console.log("Connected:", socket.id);
 
   // ─── Presence ───────────────────────────────────────────────────────
-  socket.on("join", async (userId) => {
-    (socket as any).userId = userId;
+  socket.on("join", async () => {
+    const userId = (socket as any).userId;
     socket.join(userId);
     console.log(`User ${userId} joined their personal room`);
     socket.broadcast.emit("user_online", userId);
@@ -103,6 +146,40 @@ io.on("connection", (socket) => {
       });
     } catch (err) {
       console.error("Auto-join group rooms error:", err);
+    }
+  });
+
+  // ─── Multi-Device Identity & Revocation ─────────────────────────────
+  socket.on("join_device", (data: { deviceId: string; userId?: string }) => {
+    if (data?.deviceId) {
+      socket.join(data.deviceId);
+      (socket as any).deviceId = data.deviceId;
+      console.log(`Socket ${socket.id} joined device room ${data.deviceId}`);
+    }
+  });
+
+  socket.on("join_pairing_room", (pairingId: string) => {
+    if (pairingId) {
+      socket.join(pairingId);
+      console.log(`Socket ${socket.id} joined pairing room ${pairingId}`);
+    }
+  });
+
+  socket.on("device_paired", (data: { pairingId: string; deviceId: string; userId: string }) => {
+    if (data?.pairingId) {
+      io.to(data.pairingId).emit("pairing_approved", data);
+    }
+    if (data?.userId) {
+      io.to(data.userId).emit("device_list_updated");
+    }
+  });
+
+  socket.on("device_revoked", (data: { deviceId: string; userId: string }) => {
+    if (data?.deviceId) {
+      io.to(data.deviceId).emit("device_revoked", { deviceId: data.deviceId });
+    }
+    if (data?.userId) {
+      io.to(data.userId).emit("device_list_updated");
     }
   });
 
@@ -137,45 +214,49 @@ io.on("connection", (socket) => {
   });
 
   socket.on("typing", (data) => {
-    // data: { receiverId, chatId, senderId }
+    // data: { receiverId, chatId }
+    const senderId = (socket as any).userId;
     if (data.chatId) {
-      socket.to(data.chatId).emit("typing", { chatId: data.chatId, senderId: data.senderId });
+      socket.to(data.chatId).emit("typing", { chatId: data.chatId, senderId });
     } else if (data.receiverId) {
-      io.to(data.receiverId).emit("typing", { senderId: data.senderId });
+      io.to(data.receiverId).emit("typing", { senderId });
     }
   });
   
   socket.on("stop_typing", (data) => {
-    // data: { receiverId, chatId, senderId }
+    // data: { receiverId, chatId }
+    const senderId = (socket as any).userId;
     if (data.chatId) {
-      socket.to(data.chatId).emit("stop_typing", { chatId: data.chatId, senderId: data.senderId });
+      socket.to(data.chatId).emit("stop_typing", { chatId: data.chatId, senderId });
     } else if (data.receiverId) {
-      io.to(data.receiverId).emit("stop_typing", { senderId: data.senderId });
+      io.to(data.receiverId).emit("stop_typing", { senderId });
     }
   });
 
   socket.on("mark_seen", (data) => {
-    // data: { senderId, chatId, receiverId }
+    // data: { senderId, chatId }
+    const receiverId = (socket as any).userId;
     if (data.chatId) {
-      socket.to(data.chatId).emit("messages_seen", { chatId: data.chatId, receiverId: data.receiverId, readAt: new Date().toISOString() });
+      socket.to(data.chatId).emit("messages_seen", { chatId: data.chatId, receiverId, readAt: new Date().toISOString() });
     } else if (data.senderId) {
-      io.to(data.senderId).emit("messages_seen", { receiverId: data.receiverId, readAt: new Date().toISOString() });
+      io.to(data.senderId).emit("messages_seen", { receiverId, readAt: new Date().toISOString() });
     }
   });
 
   // Per-message read receipt (for tooltip)
   socket.on("read_receipt", (data) => {
+    const userId = (socket as any).userId;
     if (data.chatId) {
       socket.to(data.chatId).emit("read_receipt", {
         chatId: data.chatId,
         messageId: data.messageId,
-        userId: data.userId,
+        userId,
         readAt: data.readAt,
       });
     } else if (data.targetId) {
       io.to(data.targetId).emit("read_receipt", {
         messageId: data.messageId,
-        userId: data.userId,
+        userId,
         readAt: data.readAt,
       });
     }
@@ -279,11 +360,12 @@ io.on("connection", (socket) => {
   // ─── WebRTC Signaling (Audio / Video Calls) ─────────────────────────
   // Caller → Callee: initiate a call
   socket.on("call_user", async (data) => {
-    // data: { calleeId, offer, callType: "audio"|"video", callerId, callerName }
+    // data: { calleeId, offer, callType: "audio"|"video", callerName }
+    const callerId = (socket as any).userId;
     try {
       await connectDB();
       const newCall = await Call.create({
-        caller: data.callerId,
+        caller: callerId,
         participants: [data.calleeId],
         type: data.callType === "video" ? "video" : "voice",
         status: "missed", // default status
@@ -292,18 +374,18 @@ io.on("connection", (socket) => {
 
       const callInfo = {
         callId: newCall._id.toString(),
-        callerId: data.callerId,
+        callerId: callerId,
         calleeId: data.calleeId,
         initiatedAt: new Date(),
       };
 
-      activeCalls.set(data.callerId, callInfo);
+      activeCalls.set(callerId, callInfo);
       activeCalls.set(data.calleeId, callInfo);
 
       io.to(data.calleeId).emit("incoming_call", {
         offer: data.offer,
         callType: data.callType,
-        callerId: data.callerId,
+        callerId: callerId,
         callerName: data.callerName,
         callId: newCall._id.toString(),
       });
@@ -315,8 +397,9 @@ io.on("connection", (socket) => {
   // Callee → Caller: accept with SDP answer
   socket.on("call_answer", async (data) => {
     // data: { callerId, answer }
+    const calleeId = (socket as any).userId;
     const callInfo = activeCalls.get(data.callerId);
-    if (callInfo) {
+    if (callInfo && callInfo.calleeId === calleeId) {
       callInfo.connectedAt = new Date();
       try {
         await connectDB();
@@ -390,15 +473,16 @@ io.on("connection", (socket) => {
 
   // ─── Group WebRTC Calling ────────────────────────────────────────────
   socket.on("group_call_start", async (data) => {
-    // data: { chatId, callerId, callerName, callType }
+    // data: { chatId, callerName, callType }
+    const callerId = (socket as any).userId;
     try {
       await connectDB();
       const chat = await Chat.findById(data.chatId);
-      const participants = chat ? chat.users.filter((u: any) => u.toString() !== data.callerId) : [];
+      const participants = chat ? chat.users.filter((u: any) => u.toString() !== callerId) : [];
 
       const newCall = await Call.create({
         chatId: data.chatId,
-        caller: data.callerId,
+        caller: callerId,
         participants,
         type: data.callType === "video" ? "video" : "voice",
         status: "completed",
@@ -409,28 +493,32 @@ io.on("connection", (socket) => {
         callId: newCall._id.toString(),
         chatId: data.chatId,
         startedAt: new Date(),
-        activeUsers: new Set<string>([data.callerId]),
+        activeUsers: new Set<string>([callerId]),
       };
 
       activeGroupCalls.set(data.chatId, groupCallInfo);
-      socket.to(data.chatId).emit("incoming_group_call", data);
+      const payload = { ...data, callerId };
+      socket.to(data.chatId).emit("incoming_group_call", payload);
     } catch (err) {
       console.error("Error starting group call:", err);
     }
   });
 
   socket.on("group_call_join", (data) => {
+    const userId = (socket as any).userId;
     const groupCallInfo = activeGroupCalls.get(data.chatId);
     if (groupCallInfo) {
-      groupCallInfo.activeUsers.add(data.userId);
+      groupCallInfo.activeUsers.add(userId);
     }
-    socket.to(data.chatId).emit("group_call_joined", data);
+    const payload = { ...data, userId };
+    socket.to(data.chatId).emit("group_call_joined", payload);
   });
 
   socket.on("group_call_leave", async (data) => {
+    const userId = (socket as any).userId;
     const groupCallInfo = activeGroupCalls.get(data.chatId);
     if (groupCallInfo) {
-      groupCallInfo.activeUsers.delete(data.userId);
+      groupCallInfo.activeUsers.delete(userId);
       if (groupCallInfo.activeUsers.size === 0) {
         try {
           await connectDB();
@@ -447,14 +535,96 @@ io.on("connection", (socket) => {
         activeGroupCalls.delete(data.chatId);
       }
     }
-    socket.to(data.chatId).emit("group_call_left", data);
+    const payload = { ...data, userId };
+    socket.to(data.chatId).emit("group_call_left", payload);
   });
 
   socket.on("group_call_signal", (data) => {
+    const senderId = (socket as any).userId;
     io.to(data.targetId).emit("group_call_signaling", {
-      senderId: data.senderId,
+      senderId,
       signal: data.signal,
     });
+  });
+
+  // ─── Account Deletion ────────────────────────────────────────────────
+  // When a user deletes their account, the server handles all cleanup.
+  // The client emits this event after the delete API succeeds.
+  // The server then: force-logouts all devices, ends active calls,
+  // notifies contacts, and disconnects all sockets for this user.
+  socket.on("account_deleted", async () => {
+    const myUserId = (socket as any).userId;
+    if (!myUserId) return;
+
+    console.log(`Account deleted for user ${myUserId}. Cleaning up...`);
+
+    // 1. Broadcast force_logout to ALL sockets in this user's room
+    //    (handles multi-device logout — other tabs/devices get logged out)
+    io.to(myUserId).emit("force_logout");
+
+    // 2. Notify all connected users that this user's account was deleted
+    //    so they can update their UI (e.g., show "Deleted User" in chat list)
+    socket.broadcast.emit("user_deleted", myUserId);
+
+    // 3. Clean up active 1-on-1 calls
+    const callInfo = activeCalls.get(myUserId);
+    if (callInfo) {
+      try {
+        await connectDB();
+        const targetId = myUserId === callInfo.callerId ? callInfo.calleeId : callInfo.callerId;
+
+        if (callInfo.connectedAt) {
+          const endedAt = new Date();
+          const duration = Math.max(0, Math.round((endedAt.getTime() - callInfo.connectedAt.getTime()) / 1000));
+          await Call.findByIdAndUpdate(callInfo.callId, {
+            endedAt,
+            duration,
+            status: "completed",
+          });
+        } else {
+          await Call.findByIdAndUpdate(callInfo.callId, {
+            status: "cancelled",
+          });
+        }
+        io.to(targetId).emit("call_ended");
+      } catch (err) {
+        console.error("Error ending call on account deletion:", err);
+      }
+      activeCalls.delete(callInfo.callerId);
+      activeCalls.delete(callInfo.calleeId);
+    }
+
+    // 4. Clean up group calls
+    for (const [chatId, groupCallInfo] of activeGroupCalls.entries()) {
+      if (groupCallInfo.activeUsers.has(myUserId)) {
+        groupCallInfo.activeUsers.delete(myUserId);
+        socket.to(chatId).emit("group_call_left", { chatId, userId: myUserId });
+        if (groupCallInfo.activeUsers.size === 0) {
+          try {
+            await connectDB();
+            const endedAt = new Date();
+            const duration = Math.max(0, Math.round((endedAt.getTime() - groupCallInfo.startedAt.getTime()) / 1000));
+            await Call.findByIdAndUpdate(groupCallInfo.callId, {
+              endedAt,
+              duration,
+              status: "completed",
+            });
+          } catch (err) {
+            console.error("Error ending group call on account deletion:", err);
+          }
+          activeGroupCalls.delete(chatId);
+        }
+      }
+    }
+
+    // 5. Broadcast user_offline since the account no longer exists
+    socket.broadcast.emit("user_offline", myUserId);
+
+    // 6. Disconnect all sockets for this user
+    const allSockets = await io.in(myUserId).fetchSockets();
+    for (const s of allSockets) {
+      s.disconnect(true);
+    }
   });
 
   // ─── Disconnect ──────────────────────────────────────────────────────
